@@ -1,0 +1,240 @@
+name: amice
+
+on:
+  push:
+    branches:
+      - master
+    tags-ignore:
+      - '**'
+    paths-ignore:
+      - 'LICENSE'
+      - '*.md'
+      - '**/*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: amice-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: '1.89.0'
+
+jobs:
+  build-linux:
+    name: Build Linux x64
+    runs-on: ubuntu-24.04
+    env:
+      BUILD_OUTPUT_PATH: target/release
+      RELEASE_ASSET_NAME: libamice-linux-x64-llvm21-1.so
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Install LLVM 21
+        run: |
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            ca-certificates \
+            gnupg \
+            libtinfo6 \
+            lsb-release \
+            software-properties-common \
+            wget
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            clang-21 \
+            libpolly-21-dev \
+            llvm-21 \
+            llvm-21-dev
+
+          echo "LLVM_SYS_211_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
+          echo "/usr/lib/llvm-21/bin" >> "$GITHUB_PATH"
+
+          if [ ! -e "/usr/lib/llvm-21/lib/libLLVM.so" ]; then
+            if [ -e "/usr/lib/llvm-21/lib/libLLVM-21.so" ]; then
+              sudo ln -sf "libLLVM-21.so" "/usr/lib/llvm-21/lib/libLLVM.so"
+            elif [ -e "/usr/lib/x86_64-linux-gnu/libLLVM-21.so.1" ]; then
+              sudo ln -sf "../../x86_64-linux-gnu/libLLVM-21.so.1" "/usr/lib/llvm-21/lib/libLLVM.so"
+            fi
+          fi
+
+      - name: Build release library
+        run: |
+          set -euxo pipefail
+          cargo build --release
+          test -f "${BUILD_OUTPUT_PATH}/libamice.so"
+
+      - name: Stage release asset
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          cp "${BUILD_OUTPUT_PATH}/libamice.so" "dist/${RELEASE_ASSET_NAME}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: amice-linux-x64
+          path: dist/${{ env.RELEASE_ASSET_NAME }}
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS arm64
+    runs-on: macos-15
+    env:
+      BUILD_OUTPUT_PATH: target/release
+      RELEASE_ASSET_NAME: libamice-macos-arm64-llvm21-1.dylib
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Install LLVM 21
+        run: |
+          set -euxo pipefail
+          brew update
+          brew install llvm@21
+          LLVM_PREFIX="$(brew --prefix llvm@21)"
+          echo "LLVM_SYS_211_PREFIX=${LLVM_PREFIX}" >> "$GITHUB_ENV"
+          echo "${LLVM_PREFIX}/bin" >> "$GITHUB_PATH"
+
+      - name: Build release library
+        run: |
+          set -euxo pipefail
+          cargo build --release
+          test -f "${BUILD_OUTPUT_PATH}/libamice.dylib"
+
+      - name: Stage release asset
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          cp "${BUILD_OUTPUT_PATH}/libamice.dylib" "dist/${RELEASE_ASSET_NAME}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: amice-macos-arm64
+          path: dist/${{ env.RELEASE_ASSET_NAME }}
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-2025
+    env:
+      BUILD_OUTPUT_PATH: target\release
+      LLVM_INSTALL_PATH: C:\LLVM
+      LLVM_ARCHIVE_NAME: llvm-lld-20.1.1-rust-1.87-windows-x86_64.7z
+      LLVM_DOWNLOAD_URL: https://github.com/jamesmth/llvm-project/releases/download/v20.1.1-rust-1.87/llvm-lld-20.1.1-rust-1.87-windows-x86_64.7z
+      RELEASE_ASSET_NAME: amice-windows-x64-llvm20-1.dll
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Install LLVM 20.1.1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path $env:LLVM_INSTALL_PATH | Out-Null
+          Invoke-WebRequest -Uri $env:LLVM_DOWNLOAD_URL -OutFile $env:LLVM_ARCHIVE_NAME
+          7z x "-oC:" $env:LLVM_ARCHIVE_NAME | Out-Null
+
+          "$env:LLVM_INSTALL_PATH\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "LLVM_SYS_201_PREFIX=$env:LLVM_INSTALL_PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build release library
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --release --no-default-features --features llvm20-1,win-link-opt
+          if (-not (Test-Path "$env:BUILD_OUTPUT_PATH\amice.dll")) {
+            throw "target\\release\\amice.dll not found"
+          }
+
+      - name: Stage release asset
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "$env:BUILD_OUTPUT_PATH\amice.dll" "dist\$env:RELEASE_ASSET_NAME"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: amice-windows-x64
+          path: dist/${{ env.RELEASE_ASSET_NAME }}
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish latest release
+    runs-on: ubuntu-24.04
+    needs:
+      - build-linux
+      - build-macos
+      - build-windows
+    if: github.ref == 'refs/heads/master'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          pattern: amice-*
+          merge-multiple: true
+
+      - name: Refresh latest tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f latest "${GITHUB_SHA}"
+          git push --force origin refs/tags/latest
+
+      - name: Publish assets to release
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          artifactErrorsFailBuild: true
+          artifacts: release-assets/*
+          body: |
+            Automated build artifacts for `${{ github.sha }}`.
+
+            Included assets:
+            - `libamice-linux-x64-llvm21-1.so`
+            - `libamice-macos-arm64-llvm21-1.dylib`
+            - `amice-windows-x64-llvm20-1.dll`
+          commit: ${{ github.sha }}
+          makeLatest: true
+          name: latest
+          removeArtifacts: true
+          replacesArtifacts: true
+          tag: latest
